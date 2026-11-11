@@ -71,6 +71,27 @@ hybrid_dispatch_impl(
     // Named barrier indices
     constexpr int kNotifyBarrierIndex = 1;
 
+    // [skipempty] Token `t` always goes through channel `t % kNumChannels`, so channels `c >= num_tokens` are empty.
+    // Each rank sends its `num_tokens` once to every scale-out peer (slot `(kNumMaxChannels, src)` of the signaled
+    // tail region, which no channel ever uses); empty channels then skip their finish signal entirely.
+    // Send warp `w` also hands its "sent-to scale-out ranks" mask to forward warp `w` (named barrier `7 + w`), which
+    // stores it in the unused field 1 of the ending row of `token_metadata_at_forward`, for the combine to skip waits.
+    constexpr int kSkipemptyHandoffBarrierBase = 7;
+    constexpr int kSkipemptyMaskSmemIdx = 0;  // uint32 index in the send warp's (idle) TMA buffer
+    EP_STATIC_ASSERT(kSkipemptyHandoffBarrierBase + kNumChannelsPerSM <= 16, "Too many channels per SM for skipempty");
+    EP_STATIC_ASSERT(kNumChannels <= kNumMaxChannels, "Too many channels");
+    EP_STATIC_ASSERT(kNumHiddenBytes >= (kSkipemptyMaskSmemIdx + 1) * static_cast<int>(sizeof(uint32_t)),
+                     "TMA buffer too small for the skipempty mask handoff");
+    constexpr int kSkipemptySlotChannel = kNumMaxChannels;
+    EP_STATIC_ASSERT(static_cast<int64_t>(kSkipemptySlotChannel + 1) * kNumScaleoutRanks <=
+                     static_cast<int64_t>(layout::WorkspaceLayout::kNumMaxRanks) * kNumMaxChannels,
+                     "skipempty num_tokens slot exceeds the signaled tail workspace");
+    const auto get_skipempty_num_tokens_ptr = [=](const int& src_scaleout_rank_idx) {
+        // NOTES: pass a prvalue, `kNumMaxChannels` is a host constexpr and must not be bound to a reference
+        return workspace_layout.get_scaleout_channel_signaled_tail_ptr(static_cast<int>(kSkipemptySlotChannel),
+                                                                       src_scaleout_rank_idx);
+    };
+
     // NCCL Gin handle
     // Each warp is a channel
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, (kNumNotifyWarps > 0)>(
@@ -379,6 +400,16 @@ hybrid_dispatch_impl(
             }
         };
 
+        // [skipempty] announce `num_tokens` to every scale-out peer (including itself), one signal per peer
+        if (sm_idx == 0 and scaleout_warp_idx == 0 and lane_idx < kNumScaleoutRanks) {
+            gin.red_add_rel<ncclTeamTagRail>(
+                get_skipempty_num_tokens_ptr(scaleout_rank_idx),
+                static_cast<int64_t>((1ull << 32) | static_cast<uint64_t>(static_cast<uint32_t>(num_tokens))),
+                lane_idx);
+        }
+        __syncwarp();
+        uint32_t skipempty_sent_mask = 0;
+
         // Iterate all tokens
         preload_next_token(channel_idx);
         for (int token_idx = channel_idx; token_idx < num_tokens; token_idx += kNumChannels) {
@@ -413,6 +444,7 @@ hybrid_dispatch_impl(
             // Update scale-out tail
             const auto scaleout_rank_mask = ptx::reduce_or(stored_dst_scaleout_rank_idx >= 0 ? (1u << stored_dst_scaleout_rank_idx) : 0u);
             stored_scaleout_tail += (scaleout_rank_mask >> lane_idx) & 1;
+            skipempty_sent_mask |= scaleout_rank_mask;
 
             // Wait TMA arrival and issue the TMA store into send buffer
             if (ptx::elect_one_sync()) {
@@ -455,7 +487,18 @@ hybrid_dispatch_impl(
         }
 
         // Flush unflushed tails
-        update_scaleout_tail(true);
+        // [skipempty] an empty channel (no tokens, so no tail either) sends no finish signal at all
+        if (channel_idx < num_tokens)
+            update_scaleout_tail(true);
+
+        // [skipempty] hand the sent-to mask to the forward warp of the same channel
+        if constexpr (not kReuseSlotIndices) {
+            if (lane_idx == 0)
+                reinterpret_cast<uint32_t*>(tma_buffer.get_base_ptr())[kSkipemptyMaskSmemIdx] = skipempty_sent_mask;
+            // NOTES: `bar.arrive` is `.aligned`, so the warp must be converged; bar.arrive/bar.sync orders the smem write
+            __syncwarp();
+            asm volatile("bar.arrive %0, %1;" :: "r"(kSkipemptyHandoffBarrierBase + scaleout_warp_idx), "r"(64) : "memory");
+        }
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -481,7 +524,30 @@ hybrid_dispatch_impl(
         int num_tokens_processed = 0;
         int stored_scaleout_old_tail_idx = 0;
         int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};
-        int stored_finish_flag = lane_idx >= kNumScaleoutRanks;
+        // [skipempty] wait for every peer's `num_tokens` (sent right after the start barrier, so it is normally
+        // already there); this channel is empty for peers with `num_tokens <= channel_idx`, which send no finish
+        int stored_skipempty_skip = 0;
+        if (lane_idx < kNumScaleoutRanks) {
+            const auto num_tokens_ptr = get_skipempty_num_tokens_ptr(lane_idx);
+            int64_t value = 0;
+            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                value = ptx::ld_acquire_sys<int64_t>(num_tokens_ptr);
+                if ((value >> 32) != 0) {
+                    // Exactly one announcement per peer per call; anything else means a stale / uncleaned slot
+                    EP_DEVICE_ASSERT((value >> 32) == 1);
+                    return true;
+                }
+                if (is_last_check) {
+                    printf("DeepEP hybrid dispatch (skipempty num_tokens) timeout, scale-out: %d, scale-up: %d, "
+                           "channel: %d, lane: %d, value: %lld\n",
+                           scaleout_rank_idx, scaleup_rank_idx, channel_idx, lane_idx, value);
+                }
+                return false;
+            });
+            stored_skipempty_skip = channel_idx >= static_cast<int>(value & 0xffffffffll);
+        }
+        __syncwarp();
+        int stored_finish_flag = lane_idx >= kNumScaleoutRanks or stored_skipempty_skip;
         int stored_scaleout_tail_idx = 0;
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;
         uint32_t wip_mask;
@@ -511,7 +577,7 @@ hybrid_dispatch_impl(
                 }
 
                 // Read new signaled tails
-                if (lane_idx < kNumScaleoutRanks) {
+                if (lane_idx < kNumScaleoutRanks and not stored_skipempty_skip) {
                     const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
                         workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx));
                     math::unpack2<int, int64_t>(signaled_tail, stored_finish_flag, stored_scaleout_tail_idx);
@@ -629,8 +695,18 @@ hybrid_dispatch_impl(
         }
 
         // Assign the source token index part of the metadata into `-1` as an ending mark
-        if (not kReuseSlotIndices and ptx::elect_one_sync())
-            token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
+        // [skipempty] field 1 of the ending row = scale-out ranks this rank's channel sent tokens to (from send warp)
+        if constexpr (not kReuseSlotIndices) {
+            asm volatile("bar.sync %0, %1;" :: "r"(kSkipemptyHandoffBarrierBase + forward_warp_idx), "r"(64) : "memory");
+            const auto sent_mask = reinterpret_cast<const uint32_t*>(
+                layout::BufferLayout<true>(token_layout, kNumScaleoutWarps + kNumForwardWarps, 1,
+                                           math::advance_ptr<int>(smem, kNumSmemBytesForNotify))
+                    .get_rank_buffer(forward_warp_idx).get_token_buffer(0).get_base_ptr())[kSkipemptyMaskSmemIdx];
+            if (ptx::elect_one_sync()) {
+                token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
+                token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims + 1] = static_cast<int>(sent_mask);
+            }
+        }
         __syncwarp();
 
         // Update linked list's ending position
@@ -667,6 +743,12 @@ hybrid_dispatch_impl(
     EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+
+    // [skipempty] clean the received `num_tokens` slots: all forward warps of this rank are past the grid sync above,
+    // and peers only write them again after the next call's start barrier (which needs this rank)
+    // NOTES: the slot is a target of remote NIC atomics, so reset it with a system-scope release store
+    if (sm_idx == 0 and thread_idx < kNumScaleoutRanks)
+        ptx::st_release_sys<int64_t>(get_skipempty_num_tokens_ptr(thread_idx), 0);
 }
 
 }  // namespace deep_ep::elastic
